@@ -32,19 +32,7 @@ harness beyond the 10 core architectural components:
      subagent to retain control across multiple tool calls) so the two
      pseudo-tools can be contrasted side by side.
 
-IMPORTANT — this example will not run successfully against every checkout:
-`core/hooks.py` (the `HookRegistry` / `HookContext` / `HookResult` module) and
-the harness's `__consult__` support are being implemented by other engineers
-in parallel isolated worktrees and may not be present yet, depending on which
-commit of the repo you're running this against. The imports and constructor
-call below (`AsynchronousHarnessLoop(..., hooks=hooks, ...)`) are written
-against the documented, agreed-upon contract for those two features, so this
-file is expected to become runnable once those workstreams land and are
-merged. Until then, treat this as a design reference / smoke-test target
-rather than something you can `python examples/hooks_and_consult_demo.py`
-today.
-
-Run with (once `core/hooks.py` and `__consult__` support exist):
+Run with:
     python examples/hooks_and_consult_demo.py
 """
 
@@ -56,18 +44,11 @@ from typing import Optional
 
 from sutra.core.budget import Budget, BudgetConfig, ModelPricing
 from sutra.core.guardrails import Guardrail
-from sutra.core.harness import HANDOFF_TOOL_NAME, AsynchronousHarnessLoop
+from sutra.core.harness import CONSULT_TOOL_NAME, HANDOFF_TOOL_NAME, AsynchronousHarnessLoop
 from sutra.core.hooks import HookContext, HookRegistry, HookResult
 from sutra.core.permissions import PermissionGate, PermissionLevel
 from sutra.models.mock_client import MockModelClient
 from sutra.toolkits import contoso_demo
-from sutra.tools.registry import Tool, ToolParameter
-
-# `__consult__` is the agent-as-tool counterpart to `HANDOFF_TOOL_NAME`
-# (`core/harness.py`'s `__handoff__`). Once `core/harness.py` exports a
-# `CONSULT_TOOL_NAME` constant of its own, prefer importing that over
-# hardcoding the literal here.
-CONSULT_TOOL_NAME = "__consult__"
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +79,7 @@ async def block_transfer_funds_hook(ctx: HookContext) -> Optional[HookResult]:
     if ctx.tool_name == "transfer_funds":
         return HookResult(
             veto=True,
-            reason="blocked by policy hook: transfer_funds is disabled in this demo environment",
+            veto_reason="blocked by policy hook: transfer_funds is disabled in this demo environment",
         )
     return None  # every other tool call proceeds untouched
 
@@ -227,35 +208,12 @@ def print_event(event) -> None:
 
 
 async def main() -> None:
-    tool_registry = contoso_demo.build_tool_registry()
-    subagent_registry = contoso_demo.build_subagent_registry()
-
-    # `__consult__` is registered the same way `__handoff__` is in
-    # contoso_demo.build_tool_registry(): as a schema-only pseudo-tool whose
+    # __consult__ is already registered as a schema-only pseudo-tool in
+    # contoso_demo.build_tool_registry(), the same way __handoff__ is — its
     # actual execution is intercepted by the harness loop, never by the
     # ToolRegistry's normal dispatch path.
-    async def _consult_placeholder(**_kwargs: object) -> None:
-        raise RuntimeError("The __consult__ pseudo-tool must be intercepted by the harness loop, not executed directly.")
-
-    tool_registry.register_tool(
-        Tool(
-            name=CONSULT_TOOL_NAME,
-            description=(
-                "Ask a specialist subagent a bounded question and get the answer back as a tool "
-                "result, WITHOUT transferring control. Use this instead of __handoff__ when you "
-                "just need information from a specialist, not a permanent transfer."
-            ),
-            parameters=[
-                ToolParameter("target_agent_id", "string", "The registered subagent id to consult."),
-                ToolParameter("question", "string", "The specific question to ask the specialist."),
-                ToolParameter(
-                    "context_payload", "object", "Structured context to brief the specialist with.", required=False
-                ),
-            ],
-            handler=_consult_placeholder,
-            permission_level=PermissionLevel.LOW,
-        )
-    )
+    tool_registry = contoso_demo.build_tool_registry()
+    subagent_registry = contoso_demo.build_subagent_registry()
 
     hooks = HookRegistry()
     hooks.register("pre_tool_call", audit_log_hook)
