@@ -18,6 +18,8 @@ class EventType(str, Enum):
     PERMISSION_REQUEST = "permission_request"
     PERMISSION_RESOLVED = "permission_resolved"
     HANDOFF = "handoff"
+    CONSULT_START = "consult_start"
+    CONSULT_END = "consult_end"
     BUDGET_WARNING = "budget_warning"
     BUDGET_EXCEEDED = "budget_exceeded"
     COMPACTION = "compaction"

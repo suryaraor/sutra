@@ -29,6 +29,15 @@ class HandoffError(SutraError):
     pass
 
 
+class ConsultError(SutraError):
+    """Raised when a `__consult__` request is malformed or its target is invalid.
+
+    Unlike `HandoffError` (which fails the whole run), a `ConsultError` is
+    always caught locally by `_handle_consult()` and turned into an
+    error-flavored tool result — the calling agent's turn continues.
+    """
+
+
 class ToolExecutionError(SutraError):
     def __init__(self, message: str, *, tool_name: str, original_error: str) -> None:
         super().__init__(message)
