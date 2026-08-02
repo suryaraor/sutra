@@ -24,6 +24,7 @@ class PermissionRequest:
     arguments: Dict[str, Any]
     level: PermissionLevel
     reason: str
+    tool_call_id: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     resolved: bool = False
     approved: Optional[bool] = None
@@ -37,6 +38,7 @@ class PermissionRequest:
             "arguments": self.arguments,
             "level": self.level.value,
             "reason": self.reason,
+            "tool_call_id": self.tool_call_id,
             "created_at": self.created_at,
             "resolved": self.resolved,
             "approved": self.approved,
@@ -70,10 +72,23 @@ class PermissionGate:
     def requires_gate(self, level: PermissionLevel) -> bool:
         return self._ORDER[level] >= self._ORDER[self.require_approval_from]
 
-    def open_request(self, tool_name: str, arguments: Dict[str, Any], level: PermissionLevel, reason: str) -> PermissionRequest:
+    def open_request(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        level: PermissionLevel,
+        reason: str,
+        *,
+        tool_call_id: Optional[str] = None,
+    ) -> PermissionRequest:
         request_id = uuid.uuid4().hex[:12]
         request = PermissionRequest(
-            request_id=request_id, tool_name=tool_name, arguments=arguments, level=level, reason=reason
+            request_id=request_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            level=level,
+            reason=reason,
+            tool_call_id=tool_call_id,
         )
         self._pending[request_id] = request
         self._futures[request_id] = asyncio.get_running_loop().create_future()

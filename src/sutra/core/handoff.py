@@ -41,5 +41,7 @@ class HandoffRouter:
         return (
             f"[HANDOFF] Control transferred from '{from_agent_id}' to '{request.target_agent_id}'.\n"
             f"Reason: {request.reason}\n"
-            f"Context payload:\n{payload_lines if payload_lines else '(none)'}"
+            f"Context payload:\n{payload_lines if payload_lines else '(none)'}\n\n"
+            "You are now the active agent. Proceed immediately using your available tools to "
+            "resolve the request — do not just acknowledge this message."
         )

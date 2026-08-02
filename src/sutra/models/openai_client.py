@@ -37,6 +37,28 @@ class OpenAIModelClient(ModelClient):
             for t in tools
         ]
 
+    @staticmethod
+    def _normalize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # The harness's wire format carries `function.arguments` as a raw
+        # dict (matching Ollama's schema). OpenAI's Chat Completions API
+        # requires it JSON-encoded as a string instead.
+        normalized = []
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                m = dict(m)
+                m["tool_calls"] = [
+                    {
+                        **tc,
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": json.dumps(tc["function"].get("arguments", {})),
+                        },
+                    }
+                    for tc in m["tool_calls"]
+                ]
+            normalized.append(m)
+        return normalized
+
     async def stream(
         self,
         *,
@@ -44,7 +66,7 @@ class OpenAIModelClient(ModelClient):
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
     ) -> AsyncIterator[StreamChunk]:
-        oai_messages = [{"role": "system", "content": system_prompt}, *messages]
+        oai_messages = [{"role": "system", "content": system_prompt}, *self._normalize_history(messages)]
         tool_call_buffers: Dict[int, Dict[str, Any]] = {}
 
         try:

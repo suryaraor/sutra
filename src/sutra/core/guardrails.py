@@ -30,9 +30,19 @@ _DEFAULT_INJECTION_PATTERNS: List[Tuple[str, str]] = [
     ("exfiltrate_secrets", r"(dump|leak|exfiltrate)\s+(all\s+)?(secrets|credentials|api\s*keys|passwords?)"),
 ]
 
+# Always-on by default: essentially never legitimate for a tool result to
+# contain a credit card or SSN, regardless of which tool produced it.
 _DEFAULT_PII_PATTERNS: List[Tuple[str, str]] = [
     ("credit_card", r"\b(?:\d[ -]*?){13,16}\b"),
     ("ssn", r"\b\d{3}-\d{2}-\d{4}\b"),
+]
+
+# Opt-in: an email address in a tool result is routinely legitimate data
+# (a "sent to X" confirmation, a contact lookup, an account owner field) —
+# redacting it unconditionally breaks those tools rather than protecting
+# anyone. Enable via GuardrailConfig(redact_emails_in_output=True) for
+# tools/domains where an email appearing in output really would be a leak.
+_OPTIONAL_PII_PATTERNS: List[Tuple[str, str]] = [
     ("email", r"\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b"),
 ]
 
@@ -41,6 +51,7 @@ _DEFAULT_PII_PATTERNS: List[Tuple[str, str]] = [
 class GuardrailConfig:
     enable_default_injection_rules: bool = True
     enable_default_pii_redaction: bool = True
+    redact_emails_in_output: bool = False
     blocklist_terms: List[str] = field(default_factory=list)
 
 
@@ -68,6 +79,9 @@ class Guardrail:
         if self.config.enable_default_pii_redaction:
             for name, pattern in _DEFAULT_PII_PATTERNS:
                 self.add_output_rule(name, pattern, GuardrailAction.REDACT)
+            if self.config.redact_emails_in_output:
+                for name, pattern in _OPTIONAL_PII_PATTERNS:
+                    self.add_output_rule(name, pattern, GuardrailAction.REDACT)
 
     def add_input_rule(self, name: str, pattern: str, action: GuardrailAction = GuardrailAction.BLOCK) -> None:
         self.input_rules.append(GuardrailRule(name, re.compile(pattern, re.IGNORECASE), action))

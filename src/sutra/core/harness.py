@@ -220,6 +220,7 @@ class AsynchronousHarnessLoop:
                     role=Role.TOOL,
                     content=f"Permission denied for tool '{request.tool_name}' by {actor}.",
                     name=request.tool_name,
+                    tool_call_id=request.tool_call_id,
                 )
             )
             yield SSEEvent(EventType.DONE, {"status": self.state.status.value})
@@ -239,7 +240,9 @@ class AsynchronousHarnessLoop:
         except GuardrailViolation as violation:
             result_text = f"[output redacted by guardrail: {violation.rule_name}]"
 
-        self.state.append_message(Message(role=Role.TOOL, content=result_text, name=request.tool_name))
+        self.state.append_message(
+            Message(role=Role.TOOL, content=result_text, name=request.tool_name, tool_call_id=request.tool_call_id)
+        )
         yield SSEEvent(EventType.TOOL_RESULT, {"tool_name": request.tool_name, "result": result_text})
 
         # Continue the turn: feed the tool result back into the model.
@@ -251,6 +254,7 @@ class AsynchronousHarnessLoop:
     async def _dispatch_tool_call(self, call: Dict[str, Any], agent_id: str) -> AsyncIterator[SSEEvent]:
         tool_name = call.get("name", "")
         arguments = call.get("input", {}) or {}
+        tool_call_id = call.get("id") or ""
 
         yield SSEEvent(EventType.TOOL_CALL, {"tool_name": tool_name, "arguments": arguments, "agent": agent_id})
 
@@ -272,10 +276,15 @@ class AsynchronousHarnessLoop:
                 arguments=arguments,
                 level=tool.permission_level,
                 reason=f"Tool '{tool_name}' is classified {tool.permission_level.value} risk and requires human approval.",
+                tool_call_id=tool_call_id,
             )
             self.state.status = HarnessStatus.PAUSED_FOR_PERMISSION
             self.state.pending_permission = PendingPermission(
-                request_id=request.request_id, tool_name=tool_name, arguments=arguments, reason=request.reason
+                request_id=request.request_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason=request.reason,
+                tool_call_id=tool_call_id,
             )
             self.state.record_step("permission_wait", tool_name=tool_name, request_id=request.request_id)
             yield SSEEvent(
@@ -303,7 +312,7 @@ class AsynchronousHarnessLoop:
         except GuardrailViolation as violation:
             result_text = f"[output redacted by guardrail: {violation.rule_name}]"
 
-        self.state.append_message(Message(role=Role.TOOL, content=result_text, name=tool_name))
+        self.state.append_message(Message(role=Role.TOOL, content=result_text, name=tool_name, tool_call_id=tool_call_id))
         yield SSEEvent(EventType.TOOL_RESULT, {"tool_name": tool_name, "result": result_text, "agent": agent_id})
 
     async def _handle_handoff(self, arguments: Dict[str, Any], from_agent_id: str) -> AsyncIterator[SSEEvent]:
@@ -341,14 +350,40 @@ class AsynchronousHarnessLoop:
         return f"{self.state.system_prompt}\n\n[Active subagent: {profile.name}]\n{profile.system_prompt}"
 
     def _messages_for_wire(self) -> List[Dict[str, Any]]:
+        # Targets the OpenAI/Ollama-style flat tool-calling schema (assistant
+        # messages carry a `tool_calls` array; results come back as
+        # role="tool" + tool_call_id). Anthropic's Messages API instead wants
+        # block-structured content (tool_use/tool_result content blocks) and
+        # only allows user/assistant roles — AnthropicModelClient needs its
+        # own adapter over this wire format rather than consuming it as-is.
         wire: List[Dict[str, Any]] = []
         for m in self.state.messages:
             if m.role == Role.SUMMARY:
                 wire.append({"role": "user", "content": f"[CONTEXT SUMMARY]\n{m.content}"})
             elif m.role == Role.TOOL:
-                wire.append({"role": "user", "content": f"[TOOL RESULT: {m.name}]\n{m.content}"})
+                entry: Dict[str, Any] = {"role": "tool", "content": m.content}
+                if m.tool_call_id:
+                    entry["tool_call_id"] = m.tool_call_id
+                if m.name:
+                    entry["name"] = m.name
+                wire.append(entry)
             elif m.role == Role.SYSTEM:
                 wire.append({"role": "user", "content": f"[SYSTEM NOTICE]\n{m.content}"})
+            elif m.role == Role.ASSISTANT and m.tool_calls:
+                wire.append(
+                    {
+                        "role": "assistant",
+                        "content": m.content,
+                        "tool_calls": [
+                            {
+                                "id": c.get("id", ""),
+                                "type": "function",
+                                "function": {"name": c.get("name", ""), "arguments": c.get("input", {})},
+                            }
+                            for c in m.tool_calls
+                        ],
+                    }
+                )
             else:
                 wire.append({"role": m.role.value, "content": m.content})
         return wire

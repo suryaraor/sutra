@@ -71,6 +71,7 @@ class PendingPermission:
     tool_name: str
     arguments: Dict[str, Any]
     reason: str
+    tool_call_id: Optional[str] = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
