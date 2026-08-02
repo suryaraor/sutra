@@ -23,16 +23,16 @@ File-based storage under a root directory (default `.memory/`).
 
 | Method | Description |
 |---|---|
-| `read(path)` | Parse YAML frontmatter + body; return `MemoryDocument` or `None` |
+| `read(path)` | Parse flat frontmatter + body; return `MemoryDocument` or `None` |
 | `write(path, doc)` | Serialize frontmatter + body to file, creating parent dirs |
-| `write_index()` | Refresh `.memory/index.md` with a table of all known documents |
+| `write_index()` | Refresh `.memory/MEMORY.md` with a table of all known documents |
 | `persona_path()` | `instance/persona.md` |
 | `identity_path(user_id)` | `users/<user_id>/identity.md` |
 | `session_path(session_id)` | `sessions/<session_id>/session.md` |
 | `list_user_ids()` | Scan `users/` directory |
 | `list_session_ids()` | Scan `sessions/` directory, sorted newest-first |
 
-**Format:** Each file is YAML frontmatter between `---` delimiters, followed by a markdown body:
+**Format:** Each file is a simple hand-rolled flat `key: value` frontmatter block between `---` delimiters (not YAML — no nesting, lists, or types; deliberately avoids a PyYAML dependency since the metadata is always flat string key/value pairs), followed by a markdown body:
 
 ```markdown
 ---
@@ -56,8 +56,8 @@ updated_at: 2025-01-15T10:30:00
 ```python
 @dataclass
 class MemoryDocument:
-    frontmatter: Dict[str, Any]
-    body: str
+    frontmatter: Dict[str, str] = field(default_factory=dict)
+    body: str = ""
 ```
 
 ### Extraction

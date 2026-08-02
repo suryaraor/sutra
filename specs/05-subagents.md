@@ -64,8 +64,8 @@ The root system prompt is always included as the outer frame; the subagent appen
 
 **`contoso_demo.py`** registers two profiles:
 
-- `it_ops_agent` — IT Operations; allowed tools: `check_system_status`, `get_incident_details`, `escalate_incident`, `restart_service`
-- `finance_ops_agent` — Finance Operations; allowed tools: `check_account_balance`, `get_transaction_history`, `validate_transfer`, `transfer_funds`
+- `it_ops_agent` — IT Operations; allowed tools: `check_ticket_status`, `search_knowledge_base`, `restart_service`, `escalate_to_oncall`
+- `finance_ops_agent` — Finance Operations; allowed tools: `get_account_balance`, `get_transaction_history`, `send_customer_notification`, `transfer_funds`
 
 **`simple_demo.py`** — single-agent setup (no subagents registered).
 

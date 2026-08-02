@@ -34,9 +34,10 @@ Only one method. The harness calls it on every model turn with:
 ```python
 @dataclass
 class StreamChunk:
-    delta_text: Optional[str] = None          # incremental text token
+    delta_text: str = ""                      # incremental text token
     tool_call_delta: Optional[Dict] = None    # tool call accumulator; "finalized" key holds completed calls
     finished: bool = False                    # True on the last chunk
+    finish_reason: Optional[str] = None       # "stop" | "tool_use" | "max_tokens"
     usage: Optional[Dict[str, int]] = None   # {"input_tokens": N, "output_tokens": M} on finished chunk
 ```
 
@@ -45,10 +46,11 @@ class StreamChunk:
 ```python
 @dataclass
 class ModelResponse:
-    text: str
-    tool_calls: List[Dict[str, Any]]
-    input_tokens: int
-    output_tokens: int
+    content: str
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    stop_reason: str = "stop"
 ```
 
 Used in examples and tests; the harness only uses the streaming path.
@@ -59,7 +61,7 @@ Used in examples and tests; the harness only uses the streaming path.
 
 ```python
 from sutra.models.anthropic_client import AnthropicModelClient
-client = AnthropicModelClient(model="claude-sonnet-4-6")
+client = AnthropicModelClient(model="claude-sonnet-5")
 ```
 
 - Requires `pip install -e ".[anthropic]"` (`anthropic>=0.34`)
@@ -92,13 +94,37 @@ client = OllamaModelClient(model="gpt-oss:20b", base_url="http://localhost:11434
 
 ```python
 from sutra.models.mock_client import MockModelClient
-client = MockModelClient(responses=[...])
+
+def make_script():
+    call_count = {"n": 0}
+
+    def script(_messages):
+        call_count["n"] += 1
+        n = call_count["n"]
+
+        if n == 1:
+            return {
+                "text": "Handing off to the finance operations subagent.",
+                "tool_calls": [
+                    {
+                        "id": "call_handoff_1",
+                        "name": HANDOFF_TOOL_NAME,
+                        "input": {"target_agent_id": "finance_ops_agent", "reason": "..."},
+                    }
+                ],
+            }
+        return {"text": "Done.", "tool_calls": []}
+
+    return script
+
+client = MockModelClient(script=make_script())
 ```
 
 - Deterministic, network-free
-- `responses` is a list of `ModelResponse` objects yielded in order
-- Used in all tests and `examples/finance_workflow.py`
-- Emits one `StreamChunk(delta_text=response.text, ...)` per response followed by a final `StreamChunk(finished=True, usage={...})`
+- The constructor takes a single `script: ScriptFn` callable — `Callable[[List[Dict[str, Any]]], Dict[str, Any]]` — not a list of `ModelResponse` objects
+- On each call, `script(messages)` is invoked with the running wire-format conversation and must return `{"text": str, "tool_calls": [...]}` for the next assistant turn
+- Used in all tests and `examples/finance_workflow.py` (see `make_script()` there for a realistic multi-turn scripted scenario)
+- Emits one `StreamChunk(delta_text=...)` per whitespace-split word of `text`, followed by a final `StreamChunk(finished=True, finish_reason=..., tool_call_delta=..., usage={...})`
 
 ### Wire Message Format
 

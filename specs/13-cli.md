@@ -31,7 +31,11 @@ sutra --base-url http://server:11434 chat  # remote Ollama endpoint
 |---|---|---|
 | `--model` | `gpt-oss:20b` | Ollama model name |
 | `--base-url` | `http://localhost:11434` | Ollama server URL |
+| `--toolkit` | `contoso` | Toolkit for chat mode: `contoso` or `simple` |
+| `--auto-approve` | off | Automatically approve permission-gated tool calls |
 | `--user` | OS username (`getpass.getuser()`) | Identity for memory scoping |
+
+These flags are shared by the top-level parser and every subparser, so both `sutra --auto-approve run it-incident` and `sutra run it-incident --auto-approve` work.
 
 ### Bundled Scenarios (`sutra list` / `sutra run <name>`)
 
@@ -53,14 +57,14 @@ Budget and compaction thresholds are tuned (`DEMO_BUDGET_CONFIG`, `DEMO_COMPACTI
 
 Ends with a recap that only checks off components that were actually observed that run.
 
-`/demo all` runs the same tour from inside an active chat session.
+`/demo` (or `/demo all`) runs the same tour from inside an active chat session.
 
 ### Interactive Chat Slash Commands
 
 | Command | Description |
 |---|---|
 | `/memory` | Show `.memory/` contents |
-| `/demo all` | Run the automated demo tour |
+| `/demo` or `/demo all` | Run the automated demo tour (both spellings are accepted) |
 | `/exit` or `/quit` | Leave the chat |
 
 ### `HarnessRenderer`
