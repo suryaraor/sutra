@@ -25,6 +25,22 @@ Sutra is a **production-grade, LLM-agnostic asynchronous agent harness**. It thr
 | HTTP Server | `server/app.py` | [12-http-server.md](12-http-server.md) |
 | CLI | `cli/` | [13-cli.md](13-cli.md) |
 | Harness State | `core/state.py` | [14-harness-state.md](14-harness-state.md) |
+| Lifecycle Hooks | `core/hooks.py` | [15-hooks.md](15-hooks.md) |
+| Sessions API | `core/sessions.py` | [16-sessions-api.md](16-sessions-api.md) |
+
+## Recently Proposed
+
+These specs are being implemented in parallel and don't yet have an obvious
+home in the tables above — either because they extend existing components'
+modules rather than introducing a module of their own, or because they're a
+new implementation of an existing interface rather than a new architectural
+piece. They'll be reclassified into the tables above (or promoted into the
+architectural-components list) once merged and settled.
+
+| Feature | Module | Spec |
+|---|---|---|
+| Agent-as-Tool (`__consult__`) | extends `core/harness.py`, `core/handoff.py` | [17-agent-as-tool.md](17-agent-as-tool.md) |
+| Hermes-Format Tool-Calling Adapter | `models/hermes_adapter.py` | [18-hermes-format-adapter.md](18-hermes-format-adapter.md) |
 
 ## Design Invariants
 
@@ -33,6 +49,7 @@ Sutra is a **production-grade, LLM-agnostic asynchronous agent harness**. It thr
 - **Safety layers run in a fixed order**: guardrail → budget check → compaction → model call → permission gate.
 - **Every exit path** (guardrail block, budget exceeded, tool error, permission pause, normal completion) yields a terminal `DONE` SSE event.
 - **Memory recording is always in `try/finally`** — it fires on every exit path exactly once.
+- **Hooks fire from that same guaranteed-once `finally` block** — the `on_done` hook point runs exactly once per `run()` exit path, alongside memory recording, regardless of which branch (guardrail block, budget exceeded, tool error, permission pause, normal completion) triggered it.
 
 ## Data Flow (one turn)
 
