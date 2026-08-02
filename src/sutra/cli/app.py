@@ -6,9 +6,11 @@
     sutra run it-incident        run a bundled scenario non-interactively
     sutra run finance-transfer --auto-approve
     sutra demo                   fully automated, narrated tour of every component, live
+    sutra demo compaction        just the Context Compaction act (or: guardrails, it-incident, finance)
 
 Inside an interactive chat session, `/demo all` runs that same automated
-tour without leaving the chat (`/exit` / `/quit` to leave the session).
+tour without leaving the chat; `/demo compaction` (etc.) runs a single act
+(`/exit` / `/quit` to leave the session).
 
 By default it talks to a local Ollama server running `gpt-oss:20b`; override
 with --model / --base-url.
@@ -20,7 +22,7 @@ import argparse
 import asyncio
 import getpass
 import sys
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 # Must happen before any Console() is constructed: some Windows terminals
 # (classic conhost, or terminals Rich's own detection misclassifies as
@@ -210,7 +212,8 @@ async def chat_loop(
             f"[bold]Sutra[/bold] — agentic runtime harness\n"
             f"Model: [cyan]{model}[/cyan]  Toolkit: [cyan]{toolkit}[/cyan]  User: [cyan]{user_id}[/cyan]\n"
             f"Session: [cyan]{harness.state.session_id}[/cyan] [dim](pass --resume {harness.state.session_id} to continue this later)[/dim]\n"
-            f"Type a message, /demo all for a full showcase, /memory to inspect memory, or /exit to quit.",
+            f"Type a message, /demo all (or /demo compaction, /demo <act>) for a showcase, "
+            f"/memory to inspect memory, or /exit to quit.",
             border_style="cyan",
         )
     )
@@ -227,8 +230,15 @@ async def chat_loop(
             continue
         if stripped in {"/exit", "/quit"}:
             return
-        if stripped in {"/demo", "/demo all"}:
-            await run_demo(model=model, base_url=base_url)
+        if stripped == "/demo" or stripped.startswith("/demo "):
+            act_keys, unknown = resolve_demo_act_keys(stripped[len("/demo"):])
+            if unknown:
+                console.print(
+                    f"[red]Unknown demo act(s): {', '.join(unknown)}.[/red] "
+                    f"Try one of: {', '.join(DEMO_ACTS.keys())}, or /demo all"
+                )
+                continue
+            await run_demo(model=model, base_url=base_url, act_keys=act_keys)
             continue
         if stripped == "/memory":
             print_memory_summary(console, user_id=user_id)
@@ -331,36 +341,73 @@ async def _demo_act(
     )
 
 
-async def run_demo(*, model: str, base_url: str) -> None:
-    """A fully automated, narrated tour of every harness component, live.
+# Prompts for the dedicated compaction act: five short turns on one growing
+# conversation. Turn 1 plants a fact; turns 2-4 are unrelated filler to force
+# the token threshold to be crossed more than once; turn 5 asks for the
+# turn-1 fact back — proving compaction *summarized* rather than *discarded*
+# older history.
+_COMPACTION_DEMO_TURNS = [
+    "Remember this for later: the secret project codename is 'Falcon'. Also, what is 7 times 6?",
+    "Tell me one interesting sentence about the ocean.",
+    "Tell me one interesting sentence about volcanoes.",
+    "Tell me one interesting sentence about outer space.",
+    "What was the secret project codename I told you earlier?",
+]
 
-    Runs three acts back to back against the real model with no interaction
-    required: a blocked prompt injection, an IT incident that hands off to a
-    tool-restricted subagent and pauses on a gated service restart, and a
-    finance request that does the same for a gated fund transfer. Budget and
-    compaction thresholds are tuned tight enough that those two components
-    fire visibly too, not just in the final snapshot.
-    """
-    console = Console(legacy_windows=False)
-    stats = _DemoStats()
 
+async def _demo_compaction_act(console: Console, stats: _DemoStats, *, number: int, model: str, base_url: str) -> None:
+    console.rule(f"[bold cyan]Act {number}: Context Compaction — a growing conversation stays bounded[/bold cyan]")
+    console.print("[dim]Exercises: Context Compaction, Agent Harness, Streaming, Budget Monitor[/dim]")
+    console.print(
+        "[dim]Five turns on one conversation, with the compactor tuned tight (~150-token threshold, "
+        "keep the last 2 messages) so it fires more than once. Each pass folds older turns into a "
+        "running summary instead of dropping them or letting the window grow without bound. Turn 1 "
+        "plants a fact; turn 5 asks for it back — after compaction — to prove nothing was actually "
+        "lost.[/dim]\n"
+    )
+    await asyncio.sleep(0.6)
+
+    renderer = HarnessRenderer(console)
+    harness = build_harness(
+        model=model,
+        base_url=base_url,
+        toolkit="simple",
+        user_id="demo-user",
+        budget_config=BudgetConfig(max_usd=2.0, max_input_tokens=100_000, max_output_tokens=3000, max_steps=20, warn_ratio=0.3),
+        compaction_config=CompactionConfig(token_threshold=150, preserve_last_n_turns=2),
+    )
+
+    for turn_number, prompt in enumerate(_COMPACTION_DEMO_TURNS, start=1):
+        console.print(f"[bold]Turn {turn_number}:[/bold] {prompt}")
+        await drive_turn(harness, prompt, console, renderer, auto_approve=True, on_event=stats.observe)
+        console.print(
+            f"[dim]  state: {len(harness.state.messages)} message(s) held, "
+            f"{harness.state.compaction_count} compaction pass(es) so far[/dim]\n"
+        )
+
+    last_assistant = next(
+        (m.content for m in reversed(harness.state.messages) if m.role.value == "assistant" and m.content), ""
+    )
+    recalled = "falcon" in last_assistant.lower()
+    color = "green" if recalled else "yellow"
+    mark = "✓" if recalled else "?"
     console.print(
         Panel(
-            f"[bold]Sutra[/bold] — full capability showcase\nModel: [cyan]{model}[/cyan] (via Ollama)\n\n"
-            "Three acts, fully automated, all live against the model above:\n"
-            "  1. A prompt-injection attempt gets blocked before it reaches the model\n"
-            "  2. An IT incident: triage → handoff → tools → a gated service restart\n"
-            "  3. A finance request: triage → handoff → tools → a gated fund transfer\n",
-            title="sutra demo",
-            border_style="cyan",
+            f"[{color}]{mark}[/{color}] {'Recalled' if recalled else 'Did not clearly recall'} the codename from "
+            f"turn 1 in the final reply, after {harness.state.compaction_count} compaction pass(es) folded it "
+            f"into a running summary.",
+            title="Compaction integrity check",
+            border_style=color,
+            expand=False,
         )
     )
-    await asyncio.sleep(1.0)
 
+
+async def _act_guardrails(console: Console, stats: _DemoStats, *, number: int, model: str, base_url: str) -> None:
     await _demo_act(
         console,
         stats,
-        number=1,
+        number=number,
         title="Guardrails stop an attack before it reaches the model",
         exercises="Guardrails, Agent Harness",
         prompt=SCENARIOS["injection-block"][1],
@@ -368,12 +415,17 @@ async def run_demo(*, model: str, base_url: str) -> None:
         model=model,
         base_url=base_url,
     )
-    console.print()
 
+
+async def _act_compaction(console: Console, stats: _DemoStats, *, number: int, model: str, base_url: str) -> None:
+    await _demo_compaction_act(console, stats, number=number, model=model, base_url=base_url)
+
+
+async def _act_it_incident(console: Console, stats: _DemoStats, *, number: int, model: str, base_url: str) -> None:
     await _demo_act(
         console,
         stats,
-        number=2,
+        number=number,
         title="IT incident — triage hands off to a restricted specialist",
         exercises="Subagents, Handoff Protocol, Custom Tools, Streaming, Budget Monitor, Context Compaction, Permission Gates",
         prompt=SCENARIOS["it-incident"][1],
@@ -382,12 +434,13 @@ async def run_demo(*, model: str, base_url: str) -> None:
         base_url=base_url,
         approver_name="oncall-sre@contoso.com",
     )
-    console.print()
 
+
+async def _act_finance(console: Console, stats: _DemoStats, *, number: int, model: str, base_url: str) -> None:
     await _demo_act(
         console,
         stats,
-        number=3,
+        number=number,
         title="Finance request — a different specialist, a gated transfer",
         exercises="Subagents, Handoff Protocol, Custom Tools, Permission Gates",
         prompt=SCENARIOS["finance-transfer"][1],
@@ -396,7 +449,81 @@ async def run_demo(*, model: str, base_url: str) -> None:
         base_url=base_url,
         approver_name="ops-lead@contoso.com",
     )
-    console.print()
+
+
+# Canonical order also doubles as run order for `sutra demo` / `/demo all`.
+DEMO_ACTS: dict[str, tuple[str, Callable]] = {
+    "guardrails": ("A prompt-injection attempt gets blocked before it reaches the model", _act_guardrails),
+    "compaction": ("Context Compaction: a growing conversation stays bounded, nothing is lost", _act_compaction),
+    "it-incident": ("An IT incident: triage → handoff → tools → a gated service restart", _act_it_incident),
+    "finance": ("A finance request: triage → handoff → tools → a gated fund transfer", _act_finance),
+}
+
+DEMO_ACT_ALIASES = {
+    "guardrail": "guardrails",
+    "injection": "guardrails",
+    "context": "compaction",
+    "context-compaction": "compaction",
+    "it": "it-incident",
+    "incident": "it-incident",
+    "transfer": "finance",
+    "finance-transfer": "finance",
+}
+
+
+def resolve_demo_act_keys(raw: str) -> tuple[Optional[List[str]], List[str]]:
+    """Parse `/demo <...>` or `sutra demo <...>` act names.
+
+    Returns `(None, [])` for "run everything" (empty input or "all"), or
+    `(resolved_keys, unknown_tokens)` for a specific subset — resolved keys
+    are deduped and always in canonical pipeline order regardless of the
+    order they were typed in.
+    """
+    tokens = [t.lower() for t in raw.strip().split()]
+    if not tokens or tokens == ["all"]:
+        return None, []
+    resolved_set = set()
+    unknown: List[str] = []
+    for tok in tokens:
+        key = DEMO_ACT_ALIASES.get(tok, tok)
+        if key in DEMO_ACTS:
+            resolved_set.add(key)
+        else:
+            unknown.append(tok)
+    resolved = [k for k in DEMO_ACTS if k in resolved_set]
+    return resolved, unknown
+
+
+async def run_demo(*, model: str, base_url: str, act_keys: Optional[List[str]] = None) -> None:
+    """A fully automated, narrated tour of harness components, live.
+
+    With `act_keys=None` (the default), runs every act in `DEMO_ACTS` back
+    to back: a blocked prompt injection, a dedicated Context Compaction
+    demo (a growing multi-turn conversation with a fact-recall check across
+    multiple compaction passes), an IT incident that hands off to a
+    tool-restricted subagent and pauses on a gated service restart, and a
+    finance request that does the same for a gated fund transfer. Pass a
+    subset of `DEMO_ACTS` keys to run just those.
+    """
+    console = Console(legacy_windows=False)
+    stats = _DemoStats()
+
+    selected = act_keys if act_keys else list(DEMO_ACTS.keys())
+    intro_lines = "\n".join(f"  {i}. {DEMO_ACTS[key][0]}" for i, key in enumerate(selected, start=1))
+    console.print(
+        Panel(
+            f"[bold]Sutra[/bold] — capability showcase\nModel: [cyan]{model}[/cyan] (via Ollama)\n\n"
+            f"{len(selected)} act(s), fully automated, all live against the model above:\n{intro_lines}\n",
+            title="sutra demo",
+            border_style="cyan",
+        )
+    )
+    await asyncio.sleep(1.0)
+
+    for number, key in enumerate(selected, start=1):
+        _, act_fn = DEMO_ACTS[key]
+        await act_fn(console, stats, number=number, model=model, base_url=base_url)
+        console.print()
 
     console.rule("[bold green]Demo complete[/bold green]")
     checklist_lines = [
@@ -526,8 +653,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", parents=[common], help="Run a bundled scenario non-interactively")
     run_parser.add_argument("scenario", choices=sorted(SCENARIOS.keys()), help="Scenario to run")
 
-    subparsers.add_parser(
+    demo_parser = subparsers.add_parser(
         "demo", parents=[common], help="Fully automated, narrated tour of every component, live"
+    )
+    demo_parser.add_argument(
+        "acts",
+        nargs="*",
+        help=f"Run only these acts, e.g. `sutra demo compaction`. Choices: {', '.join(DEMO_ACTS.keys())}. Omit for all.",
     )
 
     subparsers.add_parser("list", help="List bundled scenarios")
@@ -572,7 +704,14 @@ def main() -> None:
                 )
             )
         elif command == "demo":
-            asyncio.run(run_demo(model=args.model, base_url=args.base_url))
+            act_keys, unknown = resolve_demo_act_keys(" ".join(args.acts))
+            if unknown:
+                console.print(
+                    f"[red]Unknown demo act(s): {', '.join(unknown)}.[/red] "
+                    f"Try one of: {', '.join(DEMO_ACTS.keys())}, or omit for all."
+                )
+                sys.exit(1)
+            asyncio.run(run_demo(model=args.model, base_url=args.base_url, act_keys=act_keys))
         else:
             asyncio.run(
                 chat_loop(

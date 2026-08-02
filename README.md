@@ -121,7 +121,14 @@ Permission-gated tool calls (CRITICAL-risk by default: `transfer_funds`, `restar
 
 Identity defaults to your OS username and persists across every future session automatically — no login step. Inside `sutra chat`, `/memory` shows the same picture as `sutra memory`.
 
-**`sutra demo`** is a single command that runs three acts back to back with no interaction required: a prompt-injection attempt gets blocked before it reaches the model, an IT incident hands off to a tool-restricted subagent and pauses on a gated service restart, and a finance request does the same for a gated fund transfer — with budget/compaction thresholds tuned so the Budget Monitor's warning and the Context Compactor both fire visibly along the way. It ends with a dynamic recap (only checking off what was actually observed that run). The same tour is available mid-conversation as a slash command: type `/demo all` inside `sutra chat`.
+**`sutra demo`** is a single command that runs four acts back to back with no interaction required:
+
+1. A prompt-injection attempt gets blocked before it reaches the model.
+2. **A dedicated Context Compaction demo**: five turns on one growing conversation with the compactor tuned tight (~150-token threshold, keep the last 2 messages), so it fires more than once and message count visibly gets folded back down each time instead of growing unbounded. Turn 1 plants a fact ("the codename is Falcon"); turn 5 asks for it back *after* two compaction passes — a real recall check, not just an assertion, confirming that the running summary actually preserved it rather than the harness silently dropping old context.
+3. An IT incident hands off to a tool-restricted subagent and pauses on a gated service restart.
+4. A finance request does the same for a gated fund transfer.
+
+Budget thresholds are tuned so the Monitor's warning fires visibly too. It ends with a dynamic recap (only checking off what was actually observed that run). The same tour is available mid-conversation as a slash command: type `/demo all` inside `sutra chat`.
 
 To use a real model provider instead of the deterministic `MockModelClient`:
 
