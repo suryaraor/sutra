@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sutra"
+version = "0.1.0"
+description = "Sutra ('the thread') — a production-grade, LLM-agnostic asynchronous agent harness."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sutra Contributors" }]
+dependencies = [
+    "pydantic>=2.6",
+    "typing-extensions>=4.10",
+]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+anthropic = ["anthropic>=0.34"]
+openai = ["openai>=1.40"]
+ollama = ["httpx>=0.27"]
+tokens = ["tiktoken>=0.7"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sutra"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
