@@ -8,6 +8,7 @@ from sutra.core.budget import Budget
 from sutra.core.compaction import ContextCompactor
 from sutra.core.exceptions import (
     BudgetExceededError,
+    ConsultError,
     GuardrailViolation,
     HandoffError,
     ModelInvocationError,
@@ -23,6 +24,7 @@ from sutra.streaming.sse import EventType, SSEEvent
 from sutra.tools.registry import ToolRegistry
 
 HANDOFF_TOOL_NAME = "__handoff__"
+CONSULT_TOOL_NAME = "__consult__"
 
 
 class AsynchronousHarnessLoop:
@@ -52,6 +54,7 @@ class AsynchronousHarnessLoop:
         system_prompt: str = "You are a helpful, safety-conscious autonomous agent.",
         state: Optional[HarnessState] = None,
         max_tool_hops_per_turn: int = 8,
+        max_consult_hops: int = 5,
     ) -> None:
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -64,6 +67,7 @@ class AsynchronousHarnessLoop:
         self.memory = memory
         self.user_id = user_id
         self.max_tool_hops_per_turn = max_tool_hops_per_turn
+        self.max_consult_hops = max_consult_hops
 
         self.state = state or HarnessState(system_prompt=system_prompt)
         if not self.state.system_prompt:
@@ -292,6 +296,11 @@ class AsynchronousHarnessLoop:
                 yield evt
             return
 
+        if tool_name == CONSULT_TOOL_NAME:
+            async for evt in self._handle_consult(arguments, agent_id, tool_call_id):
+                yield evt
+            return
+
         try:
             tool = self.tool_registry.get(tool_name)
         except Exception as exc:  # noqa: BLE001 - any lookup failure must not crash the engine
@@ -371,6 +380,206 @@ class AsynchronousHarnessLoop:
                 "context_payload": request.context_payload,
             },
         )
+
+    async def _handle_consult(
+        self, arguments: Dict[str, Any], from_agent_id: str, tool_call_id: str
+    ) -> AsyncIterator[SSEEvent]:
+        """Ask a specialist subagent a question and get an answer back as a tool result.
+
+        Unlike `__handoff__`, control never leaves `from_agent_id`:
+        `self.state.active_agent_id` / `agent_stack` are untouched, and the
+        nested sub-conversation this drives is a private aside — only its
+        final text answer is appended to `self.state.messages` (as a normal
+        `Message(role=TOOL, ...)`), never its intermediate turns.
+
+        Every nested model call still goes through the run's single shared
+        `self.budget` (`check_step()` before, `record_usage()` after — see
+        the loop below), so a consult cannot be used to bypass the run's
+        budget limits. A `BudgetExceededError` raised in here is deliberately
+        left uncaught: it propagates out through `_dispatch_tool_call()` into
+        `run()`'s own `except BudgetExceededError` handler, ending the whole
+        turn exactly as if the overrun had happened in the main loop.
+
+        Failure handling is intentionally soft: an invalid target agent, a
+        hop-limit overrun, a nested tool-execution error, or the nested agent
+        reaching for a HIGH/CRITICAL permission-gated tool (unsupported here
+        — the async pause/resume `Future` pattern used by `PermissionGate`
+        doesn't compose with this synchronous nested loop; use `__handoff__`
+        for that instead) all end the consult as a *failure*, but they do
+        NOT set `self.state.status = HarnessStatus.FAILED` for the whole run.
+        Instead, the failure text comes back as an ordinary (error-flavored)
+        tool result so the calling agent's own turn continues and it can
+        react — retry, fall back, apologize, whatever it decides.
+        """
+        target_agent_id = arguments.get("target_agent_id", "")
+        question = arguments.get("question", "")
+        context_payload = arguments.get("context_payload", {}) or {}
+
+        yield SSEEvent(EventType.CONSULT_START, {"target_agent": target_agent_id, "question": question})
+
+        try:
+            if not self.subagent_registry.has(target_agent_id):
+                raise ConsultError(
+                    f"Cannot consult unknown agent '{target_agent_id}'. "
+                    f"Registered agents: {sorted(self.subagent_registry.ids())}."
+                )
+        except ConsultError as exc:
+            async for evt in self._finish_consult(tool_call_id, from_agent_id, target_agent_id, ok=False, text=str(exc)):
+                yield evt
+            return
+
+        nested_system_prompt = self._effective_system_prompt(target_agent_id)
+        nested_tool_names = self.subagent_registry.allowed_tools_for(target_agent_id)
+        nested_tool_schemas = self.tool_registry.schemas_for(target_agent_id, nested_tool_names)
+
+        local_messages: List[Dict[str, Any]] = [
+            {"role": "user", "content": self._build_consult_prompt(question, context_payload, from_agent_id)}
+        ]
+
+        final_answer: Optional[str] = None
+        failure: Optional[str] = None
+        hop = 0
+        while True:
+            hop += 1
+            if hop > self.max_consult_hops:
+                failure = (
+                    f"Consultation with '{target_agent_id}' did not reach a final answer within "
+                    f"{self.max_consult_hops} steps."
+                )
+                break
+
+            # Shared budget: same check/record pair the main loop uses, so a
+            # consult's nested model calls count against the run's limits.
+            await self.budget.check_step()
+            self.state.record_step("consult_model_call", agent=target_agent_id, from_agent=from_agent_id, hop=hop)
+
+            text = ""
+            tool_calls: List[Dict[str, Any]] = []
+            input_tokens = output_tokens = 0
+            try:
+                async for chunk in self.model_client.stream(
+                    system_prompt=nested_system_prompt, messages=local_messages, tools=nested_tool_schemas
+                ):
+                    if chunk.delta_text:
+                        text += chunk.delta_text
+                    if chunk.tool_call_delta and "finalized" in chunk.tool_call_delta:
+                        tool_calls = chunk.tool_call_delta["finalized"]
+                    if chunk.finished and chunk.usage:
+                        input_tokens = chunk.usage.get("input_tokens", 0)
+                        output_tokens = chunk.usage.get("output_tokens", 0)
+            except ModelInvocationError as exc:
+                failure = f"Consultation with '{target_agent_id}' failed: model error: {exc}"
+                break
+
+            # Not caught here on purpose -- see the docstring above.
+            await self.budget.record_usage(input_tokens=input_tokens, output_tokens=output_tokens)
+
+            if tool_calls:
+                local_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": text,
+                        "tool_calls": [
+                            {
+                                "id": c.get("id", ""),
+                                "type": "function",
+                                "function": {"name": c.get("name", ""), "arguments": c.get("input", {})},
+                            }
+                            for c in tool_calls
+                        ],
+                    }
+                )
+            else:
+                local_messages.append({"role": "assistant", "content": text})
+                final_answer = text
+                break
+
+            gated_failure: Optional[str] = None
+            for call in tool_calls:
+                call_tool_name = call.get("name", "")
+                call_arguments = call.get("input", {}) or {}
+                call_id = call.get("id", "")
+
+                try:
+                    tool = self.tool_registry.get(call_tool_name)
+                except Exception as exc:  # noqa: BLE001 - any lookup failure must not crash the engine
+                    gated_failure = (
+                        f"Consultation with '{target_agent_id}' failed: unknown tool "
+                        f"'{call_tool_name}' ({exc})."
+                    )
+                    break
+
+                if self.permission_gate.requires_gate(tool.permission_level):
+                    gated_failure = (
+                        f"Consultation with '{target_agent_id}' required a permission-gated action "
+                        f"('{call_tool_name}', level={tool.permission_level.value}), which is not "
+                        "supported inside __consult__. Use __handoff__ instead so the run can pause "
+                        "properly for human approval."
+                    )
+                    break
+
+                try:
+                    result = await self.tool_registry.execute(call_tool_name, call_arguments)
+                except ToolExecutionError as exc:
+                    gated_failure = (
+                        f"Consultation with '{target_agent_id}' failed: tool '{call_tool_name}' "
+                        f"raised during execution: {exc}"
+                    )
+                    break
+
+                result_text = self._stringify_tool_result(result)
+                local_messages.append(
+                    {"role": "tool", "content": result_text, "tool_call_id": call_id, "name": call_tool_name}
+                )
+
+            if gated_failure:
+                failure = gated_failure
+                break
+            # Otherwise: loop back up and give the nested agent another hop
+            # with the freshly appended tool result(s).
+
+        ok = final_answer is not None
+        text_out = final_answer if ok else (failure or "Consultation failed for an unknown reason.")
+        async for evt in self._finish_consult(tool_call_id, from_agent_id, target_agent_id, ok=ok, text=text_out):
+            yield evt
+
+    @staticmethod
+    def _build_consult_prompt(question: str, context_payload: Dict[str, Any], from_agent_id: str) -> str:
+        payload_lines = "\n".join(f"- {k}: {v}" for k, v in context_payload.items())
+        payload_block = f"\n\nContext:\n{payload_lines}" if payload_lines else ""
+        return (
+            f"[CONSULT] Agent '{from_agent_id}' is asking you, as a specialist, the following "
+            "question. You do not have visibility into the rest of that agent's conversation -- "
+            "answer using only the question and context given here. Respond with a direct, final "
+            "answer; do not ask clarifying questions back.\n\n"
+            f"Question: {question}{payload_block}"
+        )
+
+    async def _finish_consult(
+        self, tool_call_id: str, from_agent_id: str, target_agent_id: str, *, ok: bool, text: str
+    ) -> AsyncIterator[SSEEvent]:
+        result_text = text
+        try:
+            result_text = self.guardrail.sanitize_output(result_text)
+        except GuardrailViolation as violation:
+            result_text = f"[output redacted by guardrail: {violation.rule_name}]"
+
+        if not ok:
+            yield SSEEvent(
+                EventType.ERROR, {"phase": "consult", "target_agent": target_agent_id, "message": result_text}
+            )
+
+        self.state.append_message(
+            Message(role=Role.TOOL, content=result_text, name=CONSULT_TOOL_NAME, tool_call_id=tool_call_id)
+        )
+        yield SSEEvent(
+            EventType.TOOL_RESULT, {"tool_name": CONSULT_TOOL_NAME, "result": result_text, "agent": from_agent_id}
+        )
+        self.state.record_step("consult", **{"from": from_agent_id, "to": target_agent_id, "ok": ok})
+
+        end_data: Dict[str, Any] = {"target_agent": target_agent_id}
+        end_data["answer" if ok else "error"] = result_text
+        yield SSEEvent(EventType.CONSULT_END, end_data)
 
     def _effective_system_prompt(self, agent_id: str) -> str:
         if agent_id == "root" or not self.subagent_registry.has(agent_id):

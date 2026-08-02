@@ -7,7 +7,7 @@ definitions live in exactly one place.
 from __future__ import annotations
 
 from sutra.agents.subagent import SubagentProfile, SubagentRegistry
-from sutra.core.harness import HANDOFF_TOOL_NAME
+from sutra.core.harness import CONSULT_TOOL_NAME, HANDOFF_TOOL_NAME
 from sutra.core.permissions import PermissionLevel
 from sutra.tools.registry import Tool, ToolParameter, ToolRegistry
 
@@ -95,6 +95,10 @@ async def transfer_funds(from_account: str, to_account: str, amount_usd: float, 
 
 async def _handoff_placeholder(**_kwargs: object) -> None:
     raise RuntimeError("The handoff pseudo-tool must be intercepted by the harness loop, not executed directly.")
+
+
+async def _consult_placeholder(**_kwargs: object) -> None:
+    raise RuntimeError("The consult pseudo-tool must be intercepted by the harness loop, not executed directly.")
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +213,27 @@ def build_tool_registry() -> ToolRegistry:
                 ToolParameter("context_payload", "object", "Structured context to brief the new agent with.", required=False),
             ],
             handler=_handoff_placeholder,
+            permission_level=PermissionLevel.LOW,
+        )
+    )
+    registry.register_tool(
+        Tool(
+            name=CONSULT_TOOL_NAME,
+            description=(
+                "Ask a specialized subagent a single question and get an answer back as a normal "
+                "tool result, WITHOUT transferring control -- you keep your own turn and stay the "
+                "active agent. Use this when you just need a specialist's input (e.g. 'what does "
+                "the runbook say about X?') to keep working yourself. Use __handoff__ instead when "
+                "the specialist should take over the request entirely."
+            ),
+            parameters=[
+                ToolParameter("target_agent_id", "string", "The registered subagent id to consult."),
+                ToolParameter("question", "string", "The question to ask the specialist subagent."),
+                ToolParameter(
+                    "context_payload", "object", "Structured context to brief the specialist with.", required=False
+                ),
+            ],
+            handler=_consult_placeholder,
             permission_level=PermissionLevel.LOW,
         )
     )
