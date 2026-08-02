@@ -8,3 +8,4 @@ dist/
 build/
 .env
 .memory/
+.sutra_sessions/

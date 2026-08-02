@@ -42,7 +42,8 @@ from sutra.core.compaction import CompactionConfig, ContextCompactor
 from sutra.core.guardrails import Guardrail
 from sutra.core.harness import AsynchronousHarnessLoop
 from sutra.core.permissions import PermissionGate, PermissionLevel
-from sutra.core.state import HarnessStatus
+from sutra.core.sessions import FileSessionStore
+from sutra.core.state import HarnessState, HarnessStatus
 from sutra.memory.manager import MemoryManager
 from sutra.models.ollama_client import OllamaModelClient
 from sutra.streaming.sse import EventType, SSEEvent
@@ -110,6 +111,7 @@ def build_harness(
     user_id: Optional[str] = None,
     budget_config: Optional[BudgetConfig] = None,
     compaction_config: Optional[CompactionConfig] = None,
+    state: Optional[HarnessState] = None,
 ) -> AsynchronousHarnessLoop:
     if toolkit == "simple":
         tool_registry = simple_demo.build_tool_registry()
@@ -131,6 +133,7 @@ def build_harness(
         memory=_memory_manager,
         user_id=user_id or default_user_id(),
         system_prompt=system_prompt,
+        state=state,
     )
 
 
@@ -185,15 +188,28 @@ async def drive_turn(
     )
 
 
-async def chat_loop(*, model: str, base_url: str, toolkit: str, user_id: str, auto_approve: bool) -> None:
+async def chat_loop(
+    *, model: str, base_url: str, toolkit: str, user_id: str, auto_approve: bool, resume: Optional[str] = None
+) -> None:
     console = Console(legacy_windows=False)
     renderer = HarnessRenderer(console)
-    harness = build_harness(model=model, base_url=base_url, toolkit=toolkit, user_id=user_id)
+    session_store = FileSessionStore()
+
+    resumed_state: Optional[HarnessState] = None
+    if resume:
+        resumed_state = session_store.load(resume)
+        if resumed_state is None:
+            console.print(
+                f"[yellow]No saved session found for[/yellow] [cyan]{resume}[/cyan][yellow] — starting a fresh session instead.[/yellow]"
+            )
+
+    harness = build_harness(model=model, base_url=base_url, toolkit=toolkit, user_id=user_id, state=resumed_state)
 
     console.print(
         Panel.fit(
             f"[bold]Sutra[/bold] — agentic runtime harness\n"
             f"Model: [cyan]{model}[/cyan]  Toolkit: [cyan]{toolkit}[/cyan]  User: [cyan]{user_id}[/cyan]\n"
+            f"Session: [cyan]{harness.state.session_id}[/cyan] [dim](pass --resume {harness.state.session_id} to continue this later)[/dim]\n"
             f"Type a message, /demo all for a full showcase, /memory to inspect memory, or /exit to quit.",
             border_style="cyan",
         )
@@ -219,6 +235,7 @@ async def chat_loop(*, model: str, base_url: str, toolkit: str, user_id: str, au
             continue
 
         await drive_turn(harness, user_input, console, renderer, auto_approve=auto_approve)
+        session_store.save(harness.state)
 
 
 async def run_scenario(*, name: str, model: str, base_url: str, user_id: str, auto_approve: bool) -> None:
@@ -439,6 +456,40 @@ def print_memory_summary(console: Console, *, user_id: str) -> None:
     )
 
 
+def print_sessions_summary(console: Console) -> None:
+    """Render every session known to `.sutra_sessions/` — full checkpointed
+    state, not the `.memory/` summaries — newest first, with enough detail
+    to decide which one to `sutra chat --resume <session_id>`."""
+    store = FileSessionStore()
+    session_ids = store.list_sessions()
+
+    if not session_ids:
+        console.print(
+            Panel(
+                "[dim](no saved sessions yet — sessions are checkpointed automatically after each chat turn)[/dim]",
+                title="Sessions",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+        return
+
+    lines = []
+    for session_id in session_ids:
+        state = store.load(session_id)
+        if state is None:
+            continue
+        lines.append(
+            f"[cyan]{session_id}[/cyan] status={state.status.value} "
+            f"active_agent={state.active_agent_id} messages={len(state.messages)}"
+        )
+
+    console.print(
+        Panel("\n".join(lines), title=f"Sessions ({len(session_ids)})", border_style="cyan", expand=False)
+    )
+    console.print(f"[dim]stored under {store.root}[/dim]\n")
+
+
 def _build_common_parser() -> argparse.ArgumentParser:
     """Shared flags, attached both to the top-level parser and each subparser
     (via `parents=`) so `sutra --auto-approve run x` and `sutra run x
@@ -454,6 +505,9 @@ def _build_common_parser() -> argparse.ArgumentParser:
     )
     common.add_argument(
         "--user", default=None, help="User id for memory (identity persists across sessions); default: OS username"
+    )
+    common.add_argument(
+        "--resume", default=None, help="Resume a previous chat session by id (see `sutra sessions`)"
     )
     return common
 
@@ -480,6 +534,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     memory_parser = subparsers.add_parser("memory", help="Show what's stored in .memory/ (same as /memory in chat)")
     memory_parser.add_argument("--user", default=None, help="Whose identity to show; default: OS username")
 
+    subparsers.add_parser(
+        "sessions", help="List saved chat sessions (resume one with `sutra chat --resume <session_id>`)"
+    )
+
     return parser
 
 
@@ -500,6 +558,10 @@ def main() -> None:
         print_memory_summary(console, user_id=args.user or default_user_id())
         return
 
+    if command == "sessions":
+        print_sessions_summary(console)
+        return
+
     user_id = getattr(args, "user", None) or default_user_id()
 
     try:
@@ -514,7 +576,12 @@ def main() -> None:
         else:
             asyncio.run(
                 chat_loop(
-                    model=args.model, base_url=args.base_url, toolkit=args.toolkit, user_id=user_id, auto_approve=args.auto_approve
+                    model=args.model,
+                    base_url=args.base_url,
+                    toolkit=args.toolkit,
+                    user_id=user_id,
+                    auto_approve=args.auto_approve,
+                    resume=getattr(args, "resume", None),
                 )
             )
     except KeyboardInterrupt:
