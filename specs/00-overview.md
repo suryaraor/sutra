@@ -25,6 +25,7 @@ Sutra is a **production-grade, LLM-agnostic asynchronous agent harness**. It thr
 | HTTP Server | `server/app.py` | [12-http-server.md](12-http-server.md) |
 | CLI | `cli/` | [13-cli.md](13-cli.md) |
 | Harness State | `core/state.py` | [14-harness-state.md](14-harness-state.md) |
+| Hooks | `core/hooks.py` | [15-hooks.md](15-hooks.md) |
 
 ## Design Invariants
 

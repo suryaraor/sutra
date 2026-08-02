@@ -15,6 +15,15 @@ from sutra.core.exceptions import (
 )
 from sutra.core.guardrails import Guardrail
 from sutra.core.handoff import HandoffRequest, HandoffRouter
+from sutra.core.hooks import (
+    ON_DONE,
+    ON_HANDOFF,
+    POST_TOOL_CALL,
+    PRE_MODEL_CALL,
+    PRE_TOOL_CALL,
+    HookContext,
+    HookRegistry,
+)
 from sutra.core.permissions import PermissionGate
 from sutra.core.state import HarnessState, HarnessStatus, Message, PendingPermission, Role
 from sutra.memory.manager import MemoryManager
@@ -48,6 +57,7 @@ class AsynchronousHarnessLoop:
         subagent_registry: Optional[SubagentRegistry] = None,
         permission_gate: Optional[PermissionGate] = None,
         memory: Optional[MemoryManager] = None,
+        hooks: Optional[HookRegistry] = None,
         user_id: str = "anonymous",
         system_prompt: str = "You are a helpful, safety-conscious autonomous agent.",
         state: Optional[HarnessState] = None,
@@ -62,6 +72,12 @@ class AsynchronousHarnessLoop:
         self.permission_gate = permission_gate or PermissionGate()
         self.handoff_router = HandoffRouter(self.subagent_registry)
         self.memory = memory
+        # Optional: named lifecycle hooks (pre_tool_call, post_tool_call,
+        # pre_model_call, on_handoff, on_done). Every call site guards with
+        # `if self.hooks is not None`, so leaving this `None` (the default)
+        # is a strict no-op — behavior is identical to a harness built before
+        # hooks existed. See specs/15-hooks.md.
+        self.hooks = hooks
         self.user_id = user_id
         self.max_tool_hops_per_turn = max_tool_hops_per_turn
 
@@ -140,6 +156,14 @@ class AsynchronousHarnessLoop:
                     system_prompt = self._effective_system_prompt(agent_id)
                     wire_messages = self._messages_for_wire()
 
+                    # 3.5. pre_model_call hook: fires once per model-call
+                    # iteration of this loop, right before the streaming
+                    # request goes out. Side-effect only — a returned
+                    # HookResult (veto or otherwise) is intentionally ignored
+                    # here; see specs/15-hooks.md.
+                    if self.hooks is not None:
+                        await self.hooks.run(PRE_MODEL_CALL, HookContext(point=PRE_MODEL_CALL, state=self.state))
+
                     assistant_text = ""
                     tool_calls: List[Dict[str, Any]] = []
                     input_tokens = output_tokens = 0
@@ -217,6 +241,7 @@ class AsynchronousHarnessLoop:
             yield SSEEvent(EventType.DONE, {"status": self.state.status.value})
         finally:
             await self._record_memory()
+            await self._fire_on_done()
 
     async def resume_after_permission(self, request_id: str, *, approved: bool, actor: str) -> AsyncIterator[SSEEvent]:
         """External entry point: unblock a paused Permission Gate and continue the turn.
@@ -227,7 +252,16 @@ class AsynchronousHarnessLoop:
         (harmless — each write is an idempotent overwrite of the latest
         snapshot) but every exit path, including denial, is guaranteed to
         record exactly once at minimum.
+
+        The `on_done` hook is handled slightly differently than memory
+        (see `_fire_on_done`): unlike an idempotent memory snapshot
+        overwrite, invoking a hook twice for the same logical completion is
+        a real, observable duplicate (e.g. double-counted metrics), so we
+        track whether this call delegated into a nested `self.run("")` — if
+        it did, that nested call's own `finally` already fired `on_done` for
+        us and we must not fire it again here.
         """
+        delegated_to_nested_run = False
         try:
             request = self.permission_gate.resolve(request_id, approved=approved, actor=actor)
             yield SSEEvent(
@@ -269,10 +303,13 @@ class AsynchronousHarnessLoop:
             yield SSEEvent(EventType.TOOL_RESULT, {"tool_name": request.tool_name, "result": result_text})
 
             # Continue the turn: feed the tool result back into the model.
+            delegated_to_nested_run = True
             async for evt in self.run(""):
                 yield evt
         finally:
             await self._record_memory()
+            if not delegated_to_nested_run:
+                await self._fire_on_done()
 
     # -- internals --------------------------------------------------------------
 
@@ -280,12 +317,54 @@ class AsynchronousHarnessLoop:
         if self.memory is not None:
             await self.memory.record_turn(user_id=self.user_id, state=self.state)
 
+    async def _fire_on_done(self) -> None:
+        """Fire the `on_done` hook, but only once the run has truly concluded.
+
+        `PAUSED_FOR_PERMISSION` is not a terminal status — the turn hasn't
+        finished, it's waiting on an external decision — so `on_done` is
+        deliberately skipped in that case. It fires later, exactly once, when
+        `resume_after_permission()` (directly, on denial/error, or via its
+        nested `self.run("")` call, on approval) drives the state to an
+        actual terminal status (`COMPLETED`, `FAILED`, `BUDGET_EXCEEDED`).
+        """
+        if self.hooks is None:
+            return
+        if self.state.status == HarnessStatus.PAUSED_FOR_PERMISSION:
+            return
+        await self.hooks.run(ON_DONE, HookContext(point=ON_DONE, state=self.state))
+
     async def _dispatch_tool_call(self, call: Dict[str, Any], agent_id: str) -> AsyncIterator[SSEEvent]:
         tool_name = call.get("name", "")
         arguments = call.get("input", {}) or {}
         tool_call_id = call.get("id") or ""
 
         yield SSEEvent(EventType.TOOL_CALL, {"tool_name": tool_name, "arguments": arguments, "agent": agent_id})
+
+        # pre_tool_call fires BEFORE the __handoff__ name-check, i.e. for
+        # every tool call this method sees, handoff pseudo-tool included.
+        # This gives a single audit/veto point visibility into (and veto
+        # power over) handoff attempts too, overlapping with the dedicated
+        # on_handoff hook below by design — see specs/15-hooks.md for the
+        # rationale. If a hook vetoes, the whole dispatch (handoff or real
+        # tool) is aborted here.
+        if self.hooks is not None:
+            hook_result = await self.hooks.run(
+                PRE_TOOL_CALL,
+                HookContext(point=PRE_TOOL_CALL, state=self.state, tool_name=tool_name, arguments=arguments),
+            )
+            if hook_result is not None and hook_result.veto:
+                self.state.status = HarnessStatus.FAILED
+                yield SSEEvent(
+                    EventType.HOOK_VETO,
+                    {
+                        "point": PRE_TOOL_CALL,
+                        "tool_name": tool_name,
+                        "reason": hook_result.veto_reason or f"pre_tool_call hook vetoed '{tool_name}'.",
+                    },
+                )
+                return
+            if hook_result is not None and hook_result.modified_arguments is not None:
+                arguments = hook_result.modified_arguments
 
         if tool_name == HANDOFF_TOOL_NAME:
             async for evt in self._handle_handoff(arguments, agent_id):
@@ -344,6 +423,18 @@ class AsynchronousHarnessLoop:
         self.state.append_message(Message(role=Role.TOOL, content=result_text, name=tool_name, tool_call_id=tool_call_id))
         yield SSEEvent(EventType.TOOL_RESULT, {"tool_name": tool_name, "result": result_text, "agent": agent_id})
 
+        # post_tool_call: side-effect only. The tool has already run and its
+        # result is already appended to state, so a HookResult(veto=True)
+        # returned here is intentionally ignored — there is nothing left to
+        # abort.
+        if self.hooks is not None:
+            await self.hooks.run(
+                POST_TOOL_CALL,
+                HookContext(
+                    point=POST_TOOL_CALL, state=self.state, tool_name=tool_name, arguments=arguments, result=result
+                ),
+            )
+
     async def _handle_handoff(self, arguments: Dict[str, Any], from_agent_id: str) -> AsyncIterator[SSEEvent]:
         request = HandoffRequest(
             target_agent_id=arguments.get("target_agent_id", ""),
@@ -356,6 +447,26 @@ class AsynchronousHarnessLoop:
             self.state.status = HarnessStatus.FAILED
             yield SSEEvent(EventType.ERROR, {"phase": "handoff", "message": str(exc)})
             return
+
+        # on_handoff fires after the target is validated but BEFORE the
+        # agent stack actually changes, so a veto can still prevent the
+        # transfer. A veto is treated exactly like a HandoffError: FAILED
+        # status, an `error` SSE event, and no push_agent().
+        if self.hooks is not None:
+            hook_result = await self.hooks.run(
+                ON_HANDOFF,
+                HookContext(
+                    point=ON_HANDOFF,
+                    state=self.state,
+                    target_agent_id=request.target_agent_id,
+                    reason=request.reason,
+                ),
+            )
+            if hook_result is not None and hook_result.veto:
+                self.state.status = HarnessStatus.FAILED
+                message = hook_result.veto_reason or f"Handoff to '{request.target_agent_id}' vetoed by hook."
+                yield SSEEvent(EventType.ERROR, {"phase": "handoff", "message": message})
+                return
 
         briefing = self.handoff_router.build_briefing(request, from_agent_id=from_agent_id)
         self.state.push_agent(request.target_agent_id)

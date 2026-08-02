@@ -22,6 +22,7 @@ class EventType(str, Enum):
     BUDGET_EXCEEDED = "budget_exceeded"
     COMPACTION = "compaction"
     ERROR = "error"
+    HOOK_VETO = "hook_veto"
     DONE = "done"
 
 
