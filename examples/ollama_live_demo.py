@@ -5,12 +5,16 @@ network-free `MockModelClient` so it can run anywhere without a GPU), this
 script talks to an actual running Ollama server and a real downloaded model
 (`gpt-oss:20b` by default). Tool-call behavior here is genuinely decided by
 the model, not scripted — this is what proves the `OllamaModelClient` wiring
-is real, not a stand-in.
+is real, not a stand-in. Tools are the small weather/dice/email toolkit in
+`sutra.toolkits.simple_demo`.
+
+For a richer multi-subagent version of this same idea, see
+`examples/live_workflow.py`, or run it interactively via the `sutra` CLI
+(`sutra` for chat, `sutra run weather-email` for this exact scenario).
 
 Prerequisites:
     - Ollama installed and running (`ollama serve`, or the desktop app).
     - The model pulled: `ollama pull gpt-oss:20b`.
-    - `pip install -e ".[ollama]"` (installs httpx).
 
 Run with:  python examples/ollama_live_demo.py
 """
@@ -29,61 +33,9 @@ from sutra.core.harness import AsynchronousHarnessLoop
 from sutra.core.permissions import PermissionGate, PermissionLevel
 from sutra.models.ollama_client import OllamaModelClient
 from sutra.streaming.sse import EventType
-from sutra.tools.registry import Tool, ToolParameter, ToolRegistry
+from sutra.toolkits import simple_demo
 
 MODEL_NAME = "gpt-oss:20b"
-
-
-async def get_current_weather(location: str) -> dict:
-    # Canned data stand-in for a real weather API, deterministic for the demo.
-    return {"location": location, "condition": "partly cloudy", "temp_c": 22, "humidity_pct": 58}
-
-
-async def roll_dice(sides: int = 6) -> dict:
-    import random
-
-    return {"sides": sides, "result": random.randint(1, sides)}
-
-
-async def send_email(to: str, subject: str, body: str) -> dict:
-    # Simulated send: real deployments would call an actual mail API here.
-    return {"status": "sent", "to": to, "subject": subject, "body_preview": body[:120]}
-
-
-def build_tool_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register_tool(
-        Tool(
-            name="get_current_weather",
-            description="Get the current weather conditions for a location.",
-            parameters=[ToolParameter("location", "string", "City name, e.g. 'Tokyo'.")],
-            handler=get_current_weather,
-            permission_level=PermissionLevel.LOW,
-        )
-    )
-    registry.register_tool(
-        Tool(
-            name="roll_dice",
-            description="Roll an N-sided die and return the result.",
-            parameters=[ToolParameter("sides", "integer", "Number of sides on the die.", required=False)],
-            handler=roll_dice,
-            permission_level=PermissionLevel.LOW,
-        )
-    )
-    registry.register_tool(
-        Tool(
-            name="send_email",
-            description="Send an email to a recipient. Sends real, externally-visible email.",
-            parameters=[
-                ToolParameter("to", "string", "Recipient email address."),
-                ToolParameter("subject", "string", "Email subject line."),
-                ToolParameter("body", "string", "Email body text."),
-            ],
-            handler=send_email,
-            permission_level=PermissionLevel.CRITICAL,
-        )
-    )
-    return registry
 
 
 def print_event(event) -> None:
@@ -96,15 +48,11 @@ def print_event(event) -> None:
 async def main() -> None:
     harness = AsynchronousHarnessLoop(
         model_client=OllamaModelClient(model=MODEL_NAME),
-        tool_registry=build_tool_registry(),
+        tool_registry=simple_demo.build_tool_registry(),
         budget=Budget(BudgetConfig(max_usd=1.0, max_input_tokens=50_000, max_output_tokens=8_000, max_steps=12)),
         guardrail=Guardrail(),
         permission_gate=PermissionGate(require_approval_from=PermissionLevel.HIGH),
-        system_prompt=(
-            "You are a helpful assistant with access to tools. Use get_current_weather and "
-            "roll_dice freely. send_email is high-risk and requires human approval, but you "
-            "should still call it when the user asks you to send an email."
-        ),
+        system_prompt=simple_demo.SYSTEM_PROMPT,
     )
 
     prompt = (
